@@ -18,3 +18,17 @@ results/
 
 analysis_results/
 *.png
+
+# SLURM logs
+*.err
+*.out
+
+# Claude Code
+.claude/
+
+# Archives
+*.zip
+
+# Misc
+Untitled
+results_m1_before_fix/

@@ -1,0 +1,92 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{hyperref}
+
+\title{COS568 Assignment 3 --- Milestone 2 Report\\
+\large Hybrid DynamicPGM + LIPP Index}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Approach}
+
+We implement a hybrid index that combines DynamicPGM (DPGM) and LIPP to exploit their complementary strengths: DPGM's efficient amortized insertion via its logarithmic buffer-merge strategy, and LIPP's fast lookup via precise learned position prediction.
+
+\paragraph{Design.}
+The hybrid maintains two internal structures: a LIPP index as the primary store and a DPGM buffer for incoming inserts. During bulk loading, all initial data is loaded into LIPP. At runtime:
+\begin{itemize}
+    \item \textbf{Insert:} New keys are inserted into DPGM. When the DPGM buffer reaches 5\% of the total key count, all buffered entries are flushed into LIPP via individual insertions, and the DPGM is reset.
+    \item \textbf{Lookup:} The DPGM buffer is checked first (small, contains recent inserts). If the key is not found, LIPP is queried.
+\end{itemize}
+This is a naive flush strategy---data is extracted from DPGM element-by-element and inserted individually into LIPP. The DPGM component uses the same hyperparameters as standalone DPGM (search method and PGM error bound $\epsilon$).
+
+\paragraph{Bug fix.}
+We applied the \texttt{asm volatile} compiler barrier fix to \texttt{benchmark.h} to prevent dead-code elimination of lookup results, which had previously inflated LIPP's measured throughput by ${\sim}120\times$.
+
+\section{Results}
+
+All experiments use the Facebook dataset (100M keys) with 3 repetitions. For DPGM and the hybrid, we select the best-performing hyperparameter configuration (BinarySearch, $\epsilon = 64$). LIPP has no tunable hyperparameters.
+
+\subsection{Throughput}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Index & 10\% Insert (Mops/s) & 90\% Insert (Mops/s) \\
+\midrule
+DynamicPGM    & 1.07          & 3.64          \\
+LIPP          & \textbf{3.01} & 1.70          \\
+HybridPGMLIPP & 1.25          & \textbf{3.85} \\
+\bottomrule
+\end{tabular}
+\caption{Mixed workload throughput on Facebook dataset (average of 3 runs, best hyperparameter configuration per index).}
+\label{tab:throughput}
+\end{table}
+
+\subsection{Index Size}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Index & 10\% Insert (GB) & 90\% Insert (GB) \\
+\midrule
+DynamicPGM    & \textbf{1.59} & \textbf{1.59} \\
+LIPP          & 11.83         & 11.79         \\
+HybridPGMLIPP & 11.82         & 11.68         \\
+\bottomrule
+\end{tabular}
+\caption{Index size on Facebook dataset.}
+\label{tab:size}
+\end{table}
+
+\subsection{Bar Plots}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\textwidth]{m2_benchmark_results.png}
+\caption{Throughput and index size comparison across both mixed workloads on the Facebook dataset. Left column: 10\% insert (lookup-heavy). Right column: 90\% insert (insert-heavy).}
+\label{fig:m2results}
+\end{figure}
+
+\section{Analysis}
+
+\paragraph{Insert-heavy workload (90\% insert).}
+The hybrid achieves the highest throughput (3.85 Mops/s), slightly outperforming standalone DPGM (3.64) and significantly outperforming LIPP (1.70). This is because inserts are routed directly to the DPGM buffer, which handles them efficiently via its logarithmic merge strategy. The infrequent lookups (10\% of operations) benefit from checking the small DPGM buffer first, and falling back to LIPP's fast learned-model lookup for the bulk-loaded data. Flushes are rare enough in this workload that their cost is amortized over many fast DPGM insertions.
+
+\paragraph{Lookup-heavy workload (10\% insert).}
+LIPP dominates (3.01 Mops/s) because 90\% of operations are lookups served directly by its precise position-predicting models. The hybrid (1.25) is slower because every lookup must first probe the DPGM buffer (which almost always misses) before falling back to LIPP, adding overhead per query. The hybrid still outperforms standalone DPGM (1.07), whose multi-level buffer structure makes lookups expensive after insertions.
+
+\paragraph{Index size.}
+The hybrid's memory footprint (${\sim}11.8$ GB) is dominated by the LIPP component, which uses gap-filled arrays and per-node learned models. DPGM is far more compact (${\sim}1.6$ GB) due to its piecewise linear approximation. The hybrid's DPGM buffer adds negligible overhead since it is periodically flushed and reset.
+
+\paragraph{Limitations.}
+The naive flush strategy---extracting and reinserting elements one by one---is expensive and limits the hybrid's throughput in lookup-heavy scenarios where flushes interrupt the fast LIPP lookup path. Milestone~3 will explore asynchronous flushing and double-buffered DPGM architectures to reduce this overhead.
+
+\end{document}

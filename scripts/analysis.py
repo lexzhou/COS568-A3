@@ -29,17 +29,20 @@ def result_analysis():
                 lookup_only_result = lookup_only_results[lookup_only_results['index_name'] == index]
                 # compute average throughput across lookup_only_result['throughput1'], lookup_only_result['throughput2'], lookup_only_result['throughput3'], then select the one with the highest throughput
                 lookuponly_throughput[index][task] = lookup_only_result[['lookup_throughput_mops1', 'lookup_throughput_mops2', 'lookup_throughput_mops3']].mean(axis=1).max()
-            except:
-                pass
+            except Exception as e:
+                print(f"Warning: {e}")
             
             # find the row where insert_lookup_result['index_name'] == index
+            # pick a single best hyperparameter config by highest combined (insert+lookup) avg throughput
             try:
                 insert_lookup_result = insert_lookup_results[insert_lookup_results['index_name'] == index]
-                # compute average throughput across insert_lookup_result['throughput1'], insert_lookup_result['throughput2'], insert_lookup_result['throughput3'], then select the one with the highest throughput
-                insertlookup_throughput[index]['lookup'][task] = insert_lookup_result[['lookup_throughput_mops1', 'lookup_throughput_mops2', 'lookup_throughput_mops3']].mean(axis=1).max()
-                insertlookup_throughput[index]['insert'][task] = insert_lookup_result[['insert_throughput_mops1', 'insert_throughput_mops2', 'insert_throughput_mops3']].mean(axis=1).max()
-            except:
-                pass
+                avg_insert = insert_lookup_result[['insert_throughput_mops1', 'insert_throughput_mops2', 'insert_throughput_mops3']].mean(axis=1)
+                avg_lookup = insert_lookup_result[['lookup_throughput_mops1', 'lookup_throughput_mops2', 'lookup_throughput_mops3']].mean(axis=1)
+                best_row = (avg_insert + avg_lookup).idxmax()
+                insertlookup_throughput[index]['insert'][task] = avg_insert.loc[best_row]
+                insertlookup_throughput[index]['lookup'][task] = avg_lookup.loc[best_row]
+            except Exception as e:
+                print(f"Warning: {e}")
             
                 
             # find the row where insert_lookup_mix_1_result['index_name'] == index
@@ -47,8 +50,8 @@ def result_analysis():
                 insert_lookup_mix_1_result = insert_lookup_mix_1_results[insert_lookup_mix_1_results['index_name'] == index]
                 # compute average throughput across insert_lookup_mix_1_result['throughput1'], insert_lookup_mix_1_result['throughput2'], insert_lookup_mix_1_result['throughput3'], then select the one with the highest throughput
                 insertlookup_mix1_throughput[index][task] = insert_lookup_mix_1_result[['mixed_throughput_mops1', 'mixed_throughput_mops2', 'mixed_throughput_mops3']].mean(axis=1).max()
-            except:
-                pass
+            except Exception as e:
+                print(f"Warning: {e}")
             
             
             # find the row where insert_lookup_mix_2_result['index_name'] == index
@@ -56,8 +59,8 @@ def result_analysis():
                 insert_lookup_mix_2_result = insert_lookup_mix_2_results[insert_lookup_mix_2_results['index_name'] == index]
                 # compute average throughput across insert_lookup_mix_2_result['throughput1'], insert_lookup_mix_2_result['throughput2'], insert_lookup_mix_2_result['throughput3'], then select the one with the highest throughput
                 insertlookup_mix2_throughput[index][task] = insert_lookup_mix_2_result[['mixed_throughput_mops1', 'mixed_throughput_mops2', 'mixed_throughput_mops3']].mean(axis=1).max()
-            except:
-                pass
+            except Exception as e:
+                print(f"Warning: {e}")
     # plot the figure of throughput, x axis is the index, y axis is the throughput
     # the figure should contain 4 subplots, each subplot corresponds to a workload, including lookup_only, insert_lookup, insert_lookup_mix1, insert_lookup_mix2
     # each subplot should contain 3 bars, each bar corresponds to a dataset (fb, osmc, books) if the throughput is not empty
@@ -94,26 +97,27 @@ def result_analysis():
         task_data = []
         for idx in indexs:
             task_data.append(insertlookup_throughput[idx]['lookup'].get(task, 0))
-        ax.bar([x + offset for x in index], task_data, bar_width/2, 
-               label=f'{task} (lookup)' if offset == 0 else "_nolegend_", 
+        ax.bar([x + offset for x in index], task_data, bar_width/2,
+               label=f'{task} (lookup)',
                color=colors[i])
         offset += bar_width/2
-    
+
     # Then plot inserts
     offset = bar_width*2
     for i, task in enumerate(tasks):
         task_data = []
         for idx in indexs:
             task_data.append(insertlookup_throughput[idx]['insert'].get(task, 0))
-        ax.bar([x + offset for x in index], task_data, bar_width/2, 
+        ax.bar([x + offset for x in index], task_data, bar_width/2,
                label=f'{task} (insert)', color=colors[i], hatch='///')
         offset += bar_width/2
-    
+
     ax.set_title('Insert-Lookup Throughput (50% insert ratio)')
     ax.set_ylabel('Throughput (Mops/s)')
+    ax.set_yscale('log')
     ax.set_xticks([x + bar_width*1.5 for x in index])
     ax.set_xticklabels(indexs)
-    ax.legend()
+    ax.legend(fontsize='small')
     
     # 3. Plot mixed workload with 10% inserts
     ax = axs[2]

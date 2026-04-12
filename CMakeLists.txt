@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
+if(POLICY CMP0167)
+  cmake_policy(SET CMP0167 OLD)
+endif()
 project(WOSD)
 
 if(UNIX AND NOT APPLE)
@@ -18,13 +21,13 @@ set(CMAKE_CXX_STANDARD 17)
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
-find_package(Boost REQUIRED COMPONENTS chrono)
+set(BOOST_ROOT "/usr/local/boost/1.85.0")
+set(Boost_INCLUDE_DIRS "/usr/local/boost/1.85.0/include")
+set(Boost_LIBRARIES "/usr/local/boost/1.85.0/lib64/libboost_chrono.so")
+include_directories(${Boost_INCLUDE_DIRS})
+link_directories("/usr/local/boost/1.85.0/lib64")
 
 add_subdirectory(dtl)
-
-if (${APPLE})
-    include_directories(/usr/local/include/) # required by Mac OS to find boost
-endif ()
 
 set(SOURCE_FILES util.h)
 
@@ -33,7 +36,8 @@ set(BENCH_SOURCES
     "benchmarks/benchmark_dynamic_pgm.cc"
     "benchmarks/benchmark_pgm.cc"
     "benchmarks/benchmark_lipp.cc"
-    "benchmarks/benchmark_btree.cc")
+    "benchmarks/benchmark_btree.cc"
+    "benchmarks/benchmark_hybrid_pgm_lipp.cc")
 
 file(GLOB_RECURSE SEARCH_SOURCES "searches/*.h" "searches/search.cpp")
 

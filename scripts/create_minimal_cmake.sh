@@ -16,6 +16,7 @@ fi
 echo "Creating minimal CMakeLists.txt..."
 cat > CMakeLists.txt << 'EOF'
 cmake_minimum_required(VERSION 3.10)
+cmake_policy(SET CMP0167 OLD)
 project(WOSD)
 
 if(UNIX AND NOT APPLE)
@@ -35,13 +36,13 @@ set(CMAKE_CXX_STANDARD 17)
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
-find_package(Boost REQUIRED COMPONENTS chrono)
+set(BOOST_ROOT "/usr/local/boost/1.85.0")
+set(Boost_INCLUDE_DIRS "/usr/local/boost/1.85.0/include")
+set(Boost_LIBRARIES "/usr/local/boost/1.85.0/lib64/libboost_chrono.so")
+include_directories(${Boost_INCLUDE_DIRS})
+link_directories("/usr/local/boost/1.85.0/lib64")
 
 add_subdirectory(dtl)
-
-if (${APPLE})
-    include_directories(/usr/local/include/) # required by Mac OS to find boost
-endif ()
 
 set(SOURCE_FILES util.h)
 
