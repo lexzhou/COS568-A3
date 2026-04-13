@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <utility>
@@ -13,8 +14,49 @@
 #include "pgm_index_dynamic.hpp"
 #include "./lipp/src/core/lipp.h"
 
+// Lightweight Bloom filter for skipping DPGM probes on negative lookups.
+// Enabled only when max_buffer > 0 (small-buffer configs for lookup-heavy workloads).
+template <size_t NumBits>
+struct MiniBloom {
+  static constexpr size_t NUM_WORDS = (NumBits + 63) / 64;
+  uint64_t bits_[NUM_WORDS];
+
+  MiniBloom() { clear(); }
+  void clear() { std::memset(bits_, 0, sizeof(bits_)); }
+
+  void insert(uint64_t key) {
+    set_bit(key * 0x9E3779B97F4A7C15ULL);
+    set_bit(key * 0x517CC1B727220A95ULL);
+    set_bit(key * 0x6C62272E07BB0142ULL);
+  }
+
+  bool may_contain(uint64_t key) const {
+    return check_bit(key * 0x9E3779B97F4A7C15ULL)
+        && check_bit(key * 0x517CC1B727220A95ULL)
+        && check_bit(key * 0x6C62272E07BB0142ULL);
+  }
+
+ private:
+  void set_bit(uint64_t h) {
+    size_t idx = (h >> 32) % NumBits;
+    bits_[idx / 64] |= (1ULL << (idx % 64));
+  }
+  bool check_bit(uint64_t h) const {
+    size_t idx = (h >> 32) % NumBits;
+    return bits_[idx / 64] & (1ULL << (idx % 64));
+  }
+};
+
+// Dummy no-op Bloom filter when disabled (max_buffer == 0).
+struct NoBloom {
+  void clear() {}
+  void insert(uint64_t) {}
+  bool may_contain(uint64_t) const { return true; }
+};
+
 // Advanced Hybrid PGM-LIPP index with:
 //   - Double-buffered DPGM (active + drain)
+//   - Bloom filter to skip DPGM probes on negative lookups
 //   - LIPP-first adaptive lookup routing
 //   - Incremental drain during inserts only
 //   - Configurable flush threshold via template parameter flush_pct (percentage)
@@ -22,6 +64,9 @@ template <class KeyType, class SearchClass, size_t pgm_error, size_t flush_pct =
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
  public:
   static constexpr size_t DRAIN_BATCH = 8;
+  // Bloom filter: 16 bits per entry when enabled, no-op when max_buffer==0
+  using BloomType = typename std::conditional<
+      (max_buffer > 0), MiniBloom<max_buffer * 16>, NoBloom>::type;
 
   HybridPGMLIPP(const std::vector<int>& params)
       : total_keys_(0), active_count_(0), drain_remaining_(0),
@@ -44,6 +89,8 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
     draining_ = false;
     drain_first_batch_ = false;
     last_drained_key_ = KeyType(0);
+    active_bloom_.clear();
+    drain_bloom_.clear();
     // LIPP-first routing when buffer < 0.5% of total keys
     lipp_first_threshold_ = std::max<size_t>(64, total_keys_ / 200);
 
@@ -61,13 +108,15 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
       if (lipp_.find(lookup_key, value)) {
         return value;
       }
-      // Check active DPGM
-      auto it = active_dpgm_.find(lookup_key);
-      if (it != active_dpgm_.end()) {
-        return it->value();
+      // Check active DPGM (skip if bloom says not present)
+      if (active_bloom_.may_contain(lookup_key)) {
+        auto it = active_dpgm_.find(lookup_key);
+        if (it != active_dpgm_.end()) {
+          return it->value();
+        }
       }
       // Check drain DPGM (keys mid-flight during incremental drain)
-      if (draining_) {
+      if (draining_ && drain_bloom_.may_contain(lookup_key)) {
         auto dit = drain_dpgm_.find(lookup_key);
         if (dit != drain_dpgm_.end()) {
           return dit->value();
@@ -75,11 +124,13 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
       }
     } else {
       // DPGM-first: buffer is large (insert-heavy), many recent keys in DPGM
-      auto it = active_dpgm_.find(lookup_key);
-      if (it != active_dpgm_.end()) {
-        return it->value();
+      if (active_bloom_.may_contain(lookup_key)) {
+        auto it = active_dpgm_.find(lookup_key);
+        if (it != active_dpgm_.end()) {
+          return it->value();
+        }
       }
-      if (draining_) {
+      if (draining_ && drain_bloom_.may_contain(lookup_key)) {
         auto dit = drain_dpgm_.find(lookup_key);
         if (dit != drain_dpgm_.end()) {
           return dit->value();
@@ -124,6 +175,7 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
     active_dpgm_.insert(data.key, data.value);
+    active_bloom_.insert(data.key);
     active_count_++;
 
     // Do incremental drain work (only during inserts to keep lookup path clean)
@@ -197,6 +249,7 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
     if (drain_remaining_ == 0 || it == drain_dpgm_.end()) {
       // Reset drain DPGM entirely (no per-entry deletion)
       drain_dpgm_ = DPGMType();
+      drain_bloom_.clear();
       drain_remaining_ = 0;
       draining_ = false;
       // Update LIPP-first threshold based on new total
@@ -222,6 +275,7 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
     total_keys_ += drained;
     drain_dpgm_ = DPGMType();
+    drain_bloom_.clear();
     drain_remaining_ = 0;
     draining_ = false;
     drain_first_batch_ = false;
@@ -231,6 +285,8 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   // Swap the active DPGM to drain position and start a new drain cycle.
   void start_drain() {
     std::swap(active_dpgm_, drain_dpgm_);
+    std::swap(active_bloom_, drain_bloom_);
+    active_bloom_.clear();
     drain_remaining_ = active_count_;
     active_count_ = 0;
     draining_ = true;
@@ -243,6 +299,8 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
 
   DPGMType active_dpgm_;
   DPGMType drain_dpgm_;
+  BloomType active_bloom_;
+  BloomType drain_bloom_;
   LIPP<KeyType, uint64_t> lipp_;
   size_t total_keys_;
   size_t active_count_;
