@@ -40,6 +40,8 @@ void benchmark_64_hybrid_pgm_lipp(tli::Benchmark<uint64_t>& benchmark, const std
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 256>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 1024>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 4096>>();
+      // Never-flush: all inserts stay in DPGM, LIPP stays perfectly bulk-loaded
+      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 250000>>();
     }
   }
   if (filename.find("books_100M") != std::string::npos) {
@@ -55,6 +57,8 @@ void benchmark_64_hybrid_pgm_lipp(tli::Benchmark<uint64_t>& benchmark, const std
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 256>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 1024>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 4096>>();
+      // Never-flush: all inserts stay in DPGM, LIPP stays perfectly bulk-loaded
+      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 250000>>();
     }
   }
   if (filename.find("osmc_100M") != std::string::npos) {
@@ -70,6 +74,8 @@ void benchmark_64_hybrid_pgm_lipp(tli::Benchmark<uint64_t>& benchmark, const std
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 256>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 1024>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 4096>>();
+      // Never-flush: all inserts stay in DPGM, LIPP stays perfectly bulk-loaded
+      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 250000>>();
     }
   }
 }

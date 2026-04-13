@@ -16,13 +16,50 @@
 
 // Lightweight Bloom filter for skipping DPGM probes on negative lookups.
 // Enabled only when max_buffer > 0 (small-buffer configs for lookup-heavy workloads).
+// Uses fixed array for small sizes (L1-friendly) and heap vector for large sizes.
+template <size_t NumBits, bool UseHeap = (NumBits > 65536)>
+struct MiniBloom;
+
+// Small Bloom filter: fixed array, fits in cache
 template <size_t NumBits>
-struct MiniBloom {
+struct MiniBloom<NumBits, false> {
   static constexpr size_t NUM_WORDS = (NumBits + 63) / 64;
   uint64_t bits_[NUM_WORDS];
 
   MiniBloom() { clear(); }
   void clear() { std::memset(bits_, 0, sizeof(bits_)); }
+
+  void insert(uint64_t key) {
+    set_bit(key * 0x9E3779B97F4A7C15ULL);
+    set_bit(key * 0x517CC1B727220A95ULL);
+    set_bit(key * 0x6C62272E07BB0142ULL);
+  }
+
+  bool may_contain(uint64_t key) const {
+    return check_bit(key * 0x9E3779B97F4A7C15ULL)
+        && check_bit(key * 0x517CC1B727220A95ULL)
+        && check_bit(key * 0x6C62272E07BB0142ULL);
+  }
+
+ private:
+  void set_bit(uint64_t h) {
+    size_t idx = (h >> 32) % NumBits;
+    bits_[idx / 64] |= (1ULL << (idx % 64));
+  }
+  bool check_bit(uint64_t h) const {
+    size_t idx = (h >> 32) % NumBits;
+    return bits_[idx / 64] & (1ULL << (idx % 64));
+  }
+};
+
+// Large Bloom filter: heap-allocated vector
+template <size_t NumBits>
+struct MiniBloom<NumBits, true> {
+  static constexpr size_t NUM_WORDS = (NumBits + 63) / 64;
+  std::vector<uint64_t> bits_;
+
+  MiniBloom() : bits_(NUM_WORDS, 0) {}
+  void clear() { std::fill(bits_.begin(), bits_.end(), 0); }
 
   void insert(uint64_t key) {
     set_bit(key * 0x9E3779B97F4A7C15ULL);
