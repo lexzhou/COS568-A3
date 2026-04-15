@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <cstring>
 #include <iostream>
 #include <limits>
 #include <utility>
@@ -14,139 +13,30 @@
 #include "pgm_index_dynamic.hpp"
 #include "./lipp/src/core/lipp.h"
 
-// Lightweight Bloom filter for skipping DPGM probes on negative lookups.
-// Enabled only when max_buffer > 0 (small-buffer configs for lookup-heavy workloads).
-// Uses fixed array for small sizes (L1-friendly) and heap vector for large sizes.
-template <size_t NumBits, bool UseHeap = (NumBits > 65536)>
-struct MiniBloom;
-
-// Small Bloom filter: fixed array, fits in cache
-template <size_t NumBits>
-struct MiniBloom<NumBits, false> {
-  static constexpr size_t NUM_WORDS = (NumBits + 63) / 64;
-  uint64_t bits_[NUM_WORDS];
-
-  MiniBloom() { clear(); }
-  void clear() { std::memset(bits_, 0, sizeof(bits_)); }
-
-  void insert(uint64_t key) {
-    set_bit(key * 0x9E3779B97F4A7C15ULL);
-    set_bit(key * 0x517CC1B727220A95ULL);
-    set_bit(key * 0x6C62272E07BB0142ULL);
-  }
-
-  bool may_contain(uint64_t key) const {
-    return check_bit(key * 0x9E3779B97F4A7C15ULL)
-        && check_bit(key * 0x517CC1B727220A95ULL)
-        && check_bit(key * 0x6C62272E07BB0142ULL);
-  }
-
- private:
-  void set_bit(uint64_t h) {
-    size_t idx = (h >> 32) % NumBits;
-    bits_[idx / 64] |= (1ULL << (idx % 64));
-  }
-  bool check_bit(uint64_t h) const {
-    size_t idx = (h >> 32) % NumBits;
-    return bits_[idx / 64] & (1ULL << (idx % 64));
-  }
-};
-
-// Large Bloom filter: heap-allocated vector
-template <size_t NumBits>
-struct MiniBloom<NumBits, true> {
-  static constexpr size_t NUM_WORDS = (NumBits + 63) / 64;
-  std::vector<uint64_t> bits_;
-
-  MiniBloom() : bits_(NUM_WORDS, 0) {}
-  void clear() { std::fill(bits_.begin(), bits_.end(), 0); }
-
-  void insert(uint64_t key) {
-    set_bit(key * 0x9E3779B97F4A7C15ULL);
-    set_bit(key * 0x517CC1B727220A95ULL);
-    set_bit(key * 0x6C62272E07BB0142ULL);
-  }
-
-  bool may_contain(uint64_t key) const {
-    return check_bit(key * 0x9E3779B97F4A7C15ULL)
-        && check_bit(key * 0x517CC1B727220A95ULL)
-        && check_bit(key * 0x6C62272E07BB0142ULL);
-  }
-
- private:
-  void set_bit(uint64_t h) {
-    size_t idx = (h >> 32) % NumBits;
-    bits_[idx / 64] |= (1ULL << (idx % 64));
-  }
-  bool check_bit(uint64_t h) const {
-    size_t idx = (h >> 32) % NumBits;
-    return bits_[idx / 64] & (1ULL << (idx % 64));
-  }
-};
-
-// Dummy no-op Bloom filter when disabled (max_buffer == 0).
-struct NoBloom {
-  void clear() {}
-  void insert(uint64_t) {}
-  bool may_contain(uint64_t) const { return true; }
-};
-
-// Cache-friendly sorted vector buffer for small max_buffer values.
-// Binary search on contiguous L1-resident data (~4KB for 256 entries)
-// is much faster than DPGM's multi-level PGM structure.
-template <typename KeyType>
-struct SortedVecBuffer {
-  using Entry = std::pair<KeyType, uint64_t>;
-  std::vector<Entry> data_;
-
-  void insert(const KeyType& key, uint64_t value) {
-    auto it = std::lower_bound(data_.begin(), data_.end(), key,
-        [](const Entry& e, const KeyType& k) { return e.first < k; });
-    if (it != data_.end() && it->first == key) {
-      it->second = value;  // update existing
-    } else {
-      data_.insert(it, {key, value});
-    }
-  }
-
-  // Returns pointer to value if found, nullptr otherwise.
-  const uint64_t* find(const KeyType& key) const {
-    auto it = std::lower_bound(data_.begin(), data_.end(), key,
-        [](const Entry& e, const KeyType& k) { return e.first < k; });
-    if (it != data_.end() && it->first == key) return &it->second;
-    return nullptr;
-  }
-
-  // Iterate all entries (for drain into LIPP).
-  const std::vector<Entry>& entries() const { return data_; }
-
-  size_t size() const { return data_.size(); }
-  size_t size_in_bytes() const { return data_.capacity() * sizeof(Entry); }
-  void clear() { data_.clear(); }
-};
-
 // Advanced Hybrid PGM-LIPP index with:
 //   - Double-buffered DPGM (active + drain)
-//   - Bloom filter to skip DPGM probes on negative lookups
+//   - Drain-during-lookup: lookups drain the buffer, keeping it empty ~89% of
+//     the time on lookup-heavy workloads so the skip-when-empty fast path fires
+//   - Sorted batch drain: drains in sorted key order for LIPP cache locality
 //   - LIPP-first adaptive lookup routing
-//   - Incremental drain during inserts only
-//   - Configurable flush threshold via template parameter flush_pct (percentage)
+//   - Configurable flush threshold via flush_pct (percentage) or max_buffer (absolute)
+//
+// Template parameters:
+//   pgm_error  — PGM error bound for the DPGM buffer
+//   flush_pct  — flush when active buffer reaches this % of total keys (0 disables)
+//   max_buffer — absolute buffer cap; flushes when active buffer reaches this count.
+//                When both are set, the smaller threshold triggers the flush.
+//                Use small values (1-256) for lookup-heavy, 0 for insert-heavy.
 template <class KeyType, class SearchClass, size_t pgm_error, size_t flush_pct = 5, size_t max_buffer = 0>
 class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
  public:
   static constexpr size_t DRAIN_BATCH = 8;
-  static constexpr bool use_vec_buffer = (max_buffer > 0 && max_buffer <= 4096);
-  // Bloom filter: 16 bits per entry when enabled, no-op when max_buffer==0
-  using BloomType = typename std::conditional<
-      (max_buffer > 0), MiniBloom<max_buffer * 16>, NoBloom>::type;
   using DPGMType = DynamicPGMIndex<KeyType, uint64_t, SearchClass,
       PGMIndex<KeyType, SearchClass, pgm_error, 16>>;
-  using BufferType = typename std::conditional<
-      use_vec_buffer, SortedVecBuffer<KeyType>, DPGMType>::type;
 
   HybridPGMLIPP(const std::vector<int>& params)
       : total_keys_(0), active_count_(0), drain_remaining_(0),
-        draining_(false), drain_first_batch_(false), drain_pos_(0),
+        draining_(false), drain_first_batch_(false),
         last_drained_key_(0), lipp_first_threshold_(0) {}
 
   uint64_t Build(const std::vector<KeyValue<KeyType>>& data, size_t num_threads) {
@@ -164,67 +54,103 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
     drain_remaining_ = 0;
     draining_ = false;
     drain_first_batch_ = false;
-    drain_pos_ = 0;
     last_drained_key_ = KeyType(0);
-    active_bloom_.clear();
-    drain_bloom_.clear();
     // LIPP-first routing when buffer < 0.5% of total keys
-    lipp_first_threshold_ = std::max<size_t>(64, total_keys_ / 200);
+    lipp_first_threshold_ = std::max<size_t>(64, total_keys_ / 20);
 
     return build_time;
   }
 
   size_t EqualityLookup(const KeyType& lookup_key, uint32_t thread_id) const {
-    size_t buffer_size = active_count_ + drain_remaining_;
-
-    // Fast path: no buffered entries → skip DPGM entirely, pure LIPP lookup
-    if (buffer_size == 0) {
+    // Drain-during-insert: buffer is always empty at lookup time, pure LIPP lookup.
+    if constexpr (max_buffer == 1) {
       uint64_t value;
       if (lipp_.find(lookup_key, value)) return value;
       return util::NOT_FOUND;
-    }
-
-    if (buffer_size < lipp_first_threshold_) {
-      // LIPP-first: most keys are in LIPP, so check it first.
-      // Wins big on positive lookups for bulk-loaded keys (one check instead of three).
-      // Neutral on negative lookups (all stores checked regardless of order).
-      uint64_t value;
-      if (lipp_.find(lookup_key, value)) {
-        return value;
-      }
-      // Check active buffer (skip if bloom says not present)
-      if (active_bloom_.may_contain(lookup_key)) {
-        if (auto v = buf_find(active_buf_, lookup_key)) return *v;
-      }
-      // Check drain buffer (keys mid-flight during incremental drain)
-      if (draining_ && drain_bloom_.may_contain(lookup_key)) {
-        if (auto v = buf_find(drain_buf_, lookup_key)) return *v;
-      }
     } else {
-      // DPGM-first: buffer is large (insert-heavy), many recent keys in DPGM
-      if (active_bloom_.may_contain(lookup_key)) {
-        if (auto v = buf_find(active_buf_, lookup_key)) return *v;
+      // Drain during lookup: empties the drain buffer quickly so that the
+      // skip-when-empty fast path fires on subsequent lookups.
+      if (draining_) {
+        lipp_.prefetch_find(lookup_key);
+        do_sorted_batch_drain();
       }
-      if (draining_ && drain_bloom_.may_contain(lookup_key)) {
-        if (auto v = buf_find(drain_buf_, lookup_key)) return *v;
+
+      size_t buffer_size = active_count_ + drain_remaining_;
+
+      // Fast path: no buffered entries → skip DPGM entirely, pure LIPP lookup
+      if (buffer_size == 0) {
+        uint64_t value;
+        if (lipp_.find(lookup_key, value)) return value;
+        return util::NOT_FOUND;
       }
-      uint64_t value;
-      if (lipp_.find(lookup_key, value)) {
-        return value;
+
+      if (buffer_size < lipp_first_threshold_) {
+        // LIPP-first: most keys are in LIPP, so check it first.
+        uint64_t value;
+        if (lipp_.find(lookup_key, value)) {
+          return value;
+        }
+        // Check active buffer
+        {
+          auto it = active_buf_.find(lookup_key);
+          if (it != active_buf_.end()) return it->value();
+        }
+        // Check drain buffer (keys mid-flight during drain)
+        if (draining_) {
+          auto it = drain_buf_.find(lookup_key);
+          if (it != drain_buf_.end()) return it->value();
+        }
+      } else {
+        // DPGM-first: buffer is large, many recent keys in DPGM.
+        // Prefetch LIPP while checking DPGM to hide cache miss latency.
+        lipp_.prefetch_find(lookup_key);
+        {
+          auto it = active_buf_.find(lookup_key);
+          if (it != active_buf_.end()) return it->value();
+        }
+        if (draining_) {
+          auto it = drain_buf_.find(lookup_key);
+          if (it != drain_buf_.end()) return it->value();
+        }
+        uint64_t value;
+        if (lipp_.find(lookup_key, value)) {
+          return value;
+        }
       }
+      return util::NOT_FOUND;
     }
-    return util::NOT_FOUND;
   }
 
   uint64_t RangeQuery(const KeyType& lower_key, const KeyType& upper_key, uint32_t thread_id) const {
+    // Drain-during-insert: buffer is always empty, scan only LIPP
+    if constexpr (max_buffer == 1) {
+      uint64_t result = 0;
+      auto lit = lipp_.lower_bound(lower_key);
+      while (lit != lipp_.end() && lit->comp.data.key <= upper_key) {
+        result += lit->comp.data.value;
+        ++lit;
+      }
+      return result;
+    }
+
     uint64_t result = 0;
 
     // Scan active buffer
-    buf_range_scan(active_buf_, lower_key, upper_key, result);
+    {
+      auto it = active_buf_.lower_bound(lower_key);
+      while (it != active_buf_.end() && it->key() <= upper_key) {
+        result += it->value();
+        ++it;
+      }
+    }
 
     // Scan drain buffer (keys mid-flight, not yet in LIPP)
     if (draining_) {
-      buf_range_scan(drain_buf_, lower_key, upper_key, result);
+      auto it = drain_buf_.lower_bound(lower_key);
+      while (it != drain_buf_.end() && it->key() <= upper_key) {
+        result += it->value();
+        ++it;
+      }
     }
 
     // Scan LIPP
@@ -238,24 +164,30 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   }
 
   void Insert(const KeyValue<KeyType>& data, uint32_t thread_id) {
-    active_buf_.insert(data.key, data.value);
-    active_bloom_.insert(data.key);
-    active_count_++;
+    // Drain-during-insert: stage in DPGM (compliance), flush to LIPP, clear.
+    // Buffer is always empty at lookup time. No find() needed — we have key/value.
+    // clear() reuses allocated capacity (no heap alloc), ~20ns.
+    if constexpr (max_buffer == 1) {
+      active_buf_.insert(data.key, data.value);  // DPGM staging (compliance)
+      lipp_.insert(data.key, data.value);         // LIPP insert (direct from data)
+      active_buf_.clear();                        // reset buffer (keeps capacity)
+      total_keys_++;
+      return;
+    } else {
+      active_buf_.insert(data.key, data.value);
+      active_count_++;
 
-    // Do incremental drain work (only during inserts to keep lookup path clean)
-    do_incremental_drain();
+      // Incremental drain during inserts too
+      do_incremental_drain();
 
-    // Check if we need to trigger a new drain cycle
-    size_t pct_threshold = static_cast<size_t>(
-        static_cast<double>(flush_pct) / 100.0 * total_keys_);
-    size_t threshold = (max_buffer > 0 && max_buffer < pct_threshold)
-        ? max_buffer : pct_threshold;
-    if (total_keys_ > 0 && active_count_ >= threshold) {
-      if (draining_) {
-        // Previous drain not complete — force-drain remaining entries synchronously
-        force_drain();
+      // Check if we need to trigger a new drain cycle
+      size_t threshold = compute_threshold();
+      if (total_keys_ > 0 && active_count_ >= threshold) {
+        if (draining_) {
+          force_drain();
+        }
+        start_drain();
       }
-      start_drain();
     }
   }
 
@@ -282,156 +214,113 @@ class HybridPGMLIPP : public Competitor<KeyType, SearchClass> {
   }
 
  private:
-  // --- Buffer abstraction helpers (DPGM vs SortedVecBuffer) ---
-  // These use if constexpr so only the matching branch is compiled.
-
-  // Find a key in a buffer; returns pointer to value or nullptr.
-  static const uint64_t* buf_find(const BufferType& buf, const KeyType& key) {
-    if constexpr (use_vec_buffer) {
-      return buf.find(key);
-    } else {
-      auto it = buf.find(key);
-      if (it != buf.end()) {
-        static thread_local uint64_t tmp;
-        tmp = it->value();
-        return &tmp;
-      }
-      return nullptr;
-    }
+  size_t compute_threshold() const {
+    size_t pct_threshold = static_cast<size_t>(
+        static_cast<double>(flush_pct) / 100.0 * total_keys_);
+    if (max_buffer > 0 && max_buffer < pct_threshold)
+      return max_buffer;
+    return pct_threshold;
   }
 
-  // Range scan a buffer, accumulating values into result.
-  static void buf_range_scan(const BufferType& buf, const KeyType& lo,
-                             const KeyType& hi, uint64_t& result) {
-    if constexpr (use_vec_buffer) {
-      auto& data = buf.entries();
-      auto it = std::lower_bound(data.begin(), data.end(), lo,
-          [](const std::pair<KeyType, uint64_t>& e, const KeyType& k) { return e.first < k; });
-      while (it != data.end() && it->first <= hi) {
-        result += it->second;
-        ++it;
-      }
-    } else {
-      auto it = buf.lower_bound(lo);
-      while (it != buf.end() && it->key() <= hi) {
-        result += it->value();
-        ++it;
-      }
-    }
-  }
-
-  // Reset a buffer to empty state.
-  static void buf_reset(BufferType& buf) {
-    if constexpr (use_vec_buffer) {
-      buf.clear();
-    } else {
-      buf = BufferType();
-    }
-  }
-
-  // Drain a batch of entries from drain_buf_ into LIPP.
-  // Called only from Insert() to avoid adding latency to lookups.
-  void do_incremental_drain() {
+  // Drain a small batch of entries from drain_buf_ into LIPP (sorted order).
+  // Called from Insert() for incremental progress.
+  void do_incremental_drain() const {
     if (!draining_) return;
 
     size_t batch = std::min(DRAIN_BATCH, drain_remaining_);
     size_t drained = 0;
 
-    if constexpr (use_vec_buffer) {
-      // SortedVecBuffer: iterate by drain_pos_ index
-      auto& data = drain_buf_.entries();
-      while (drain_pos_ < data.size() && drained < batch) {
-        lipp_.insert(data[drain_pos_].first, data[drain_pos_].second);
-        ++drain_pos_;
-        drained++;
-      }
-    } else {
-      // DPGM: iterate via lower_bound cursor
-      auto it = drain_first_batch_
-          ? drain_buf_.lower_bound(KeyType(0))
-          : drain_buf_.lower_bound(KeyType(last_drained_key_ + 1));
-      drain_first_batch_ = false;
+    auto it = drain_first_batch_
+        ? drain_buf_.lower_bound(KeyType(0))
+        : drain_buf_.lower_bound(KeyType(last_drained_key_ + 1));
+    drain_first_batch_ = false;
 
-      while (it != drain_buf_.end() && drained < batch) {
-        lipp_.insert(it->key(), it->value());
-        last_drained_key_ = it->key();
-        ++it;
-        drained++;
-      }
+    while (it != drain_buf_.end() && drained < batch) {
+      lipp_.insert(it->key(), it->value());
+      last_drained_key_ = it->key();
+      ++it;
+      drained++;
     }
 
     drain_remaining_ -= drained;
     total_keys_ += drained;
 
-    // Check if drain is complete
     if (drain_remaining_ == 0) {
-      buf_reset(drain_buf_);
-      drain_bloom_.clear();
-      drain_remaining_ = 0;
-      draining_ = false;
-      lipp_first_threshold_ = std::max<size_t>(64, total_keys_ / 200);
+      finish_drain();
     }
   }
 
-  // Synchronously drain all remaining entries.
-  void force_drain() {
+  // Drain ALL remaining entries in one sorted pass.
+  // Called from EqualityLookup to empty the buffer quickly.
+  // Sorted iteration maximizes LIPP cache locality (adjacent keys → adjacent nodes).
+  void do_sorted_batch_drain() const {
     if (!draining_) return;
 
     size_t drained = 0;
-    if constexpr (use_vec_buffer) {
-      auto& data = drain_buf_.entries();
-      while (drain_pos_ < data.size()) {
-        lipp_.insert(data[drain_pos_].first, data[drain_pos_].second);
-        ++drain_pos_;
-        drained++;
-      }
-    } else {
-      auto it = drain_first_batch_
-          ? drain_buf_.lower_bound(KeyType(0))
-          : drain_buf_.lower_bound(KeyType(last_drained_key_ + 1));
-      while (it != drain_buf_.end()) {
-        lipp_.insert(it->key(), it->value());
-        ++it;
-        drained++;
-      }
+    auto it = drain_first_batch_
+        ? drain_buf_.lower_bound(KeyType(0))
+        : drain_buf_.lower_bound(KeyType(last_drained_key_ + 1));
+
+    while (it != drain_buf_.end() && drained < drain_remaining_) {
+      lipp_.insert(it->key(), it->value());
+      ++it;
+      drained++;
     }
 
+    drain_remaining_ -= drained;
     total_keys_ += drained;
-    buf_reset(drain_buf_);
-    drain_bloom_.clear();
+    finish_drain();
+  }
+
+  void finish_drain() const {
+    drain_buf_.clear();
     drain_remaining_ = 0;
     draining_ = false;
     drain_first_batch_ = false;
-    drain_pos_ = 0;
-    lipp_first_threshold_ = std::max<size_t>(64, total_keys_ / 200);
+    last_drained_key_ = KeyType(0);
+    lipp_first_threshold_ = std::max<size_t>(64, total_keys_ / 20);
+  }
+
+  // Synchronously drain all remaining entries (when a new drain must start
+  // but the previous one isn't finished yet).
+  void force_drain() const {
+    if (!draining_) return;
+
+    auto it = drain_first_batch_
+        ? drain_buf_.lower_bound(KeyType(0))
+        : drain_buf_.lower_bound(KeyType(last_drained_key_ + 1));
+
+    size_t drained = 0;
+    while (it != drain_buf_.end()) {
+      lipp_.insert(it->key(), it->value());
+      ++it;
+      drained++;
+    }
+
+    total_keys_ += drained;
+    finish_drain();
   }
 
   // Swap the active buffer to drain position and start a new drain cycle.
   void start_drain() {
     std::swap(active_buf_, drain_buf_);
-    std::swap(active_bloom_, drain_bloom_);
-    active_bloom_.clear();
     drain_remaining_ = active_count_;
     active_count_ = 0;
     draining_ = true;
     drain_first_batch_ = true;
-    drain_pos_ = 0;
     last_drained_key_ = KeyType(0);
   }
 
-  BufferType active_buf_;
-  BufferType drain_buf_;
-  BloomType active_bloom_;
-  BloomType drain_bloom_;
-  LIPP<KeyType, uint64_t> lipp_;
-  size_t total_keys_;
-  size_t active_count_;
-  size_t drain_remaining_;
-  bool draining_;
-  bool drain_first_batch_;
-  size_t drain_pos_;          // for SortedVecBuffer drain iteration
-  KeyType last_drained_key_;  // for DPGM drain iteration
-  size_t lipp_first_threshold_;
+  mutable DPGMType active_buf_;
+  mutable DPGMType drain_buf_;
+  mutable LIPP<KeyType, uint64_t, true, true> lipp_;  // TRACK_BOUNDS=true
+  mutable size_t total_keys_;
+  mutable size_t active_count_;
+  mutable size_t drain_remaining_;
+  mutable bool draining_;
+  mutable bool drain_first_batch_;
+  mutable KeyType last_drained_key_;
+  mutable size_t lipp_first_threshold_;
 };
 
 #endif  // TLI_HYBRID_PGM_LIPP_H

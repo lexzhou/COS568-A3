@@ -23,59 +23,60 @@ void benchmark_64_hybrid_pgm_lipp(tli::Benchmark<uint64_t>& benchmark,
 
 template <int record>
 void benchmark_64_hybrid_pgm_lipp(tli::Benchmark<uint64_t>& benchmark, const std::string& filename) {
-  // For each dataset, test pgm_error=64 with various flush_pct values,
-  // plus a couple of other pgm_error values at the default flush_pct.
+  // For each dataset, sweep configurations for mixed workloads.
+  //
+  // Insert-heavy (90% insert): max_buffer=0, sweep flush_pct.
+  //   Double-buffered incremental drain handles the high insert rate.
+  //
+  // Lookup-heavy (10% insert): micro-threshold via max_buffer (1-256).
+  //   Drain-during-lookup empties the buffer on the first lookup after each
+  //   insert, so the skip-when-empty fast path fires ~89% of the time.
+  //   Also test percentage-based flush for comparison.
+
   if (filename.find("fb_100M") != std::string::npos) {
     if (filename.find("mix") != std::string::npos) {
-      // Sweep flush_pct with best pgm_error=64
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 1>>();
+      // --- Percentage-based flush (insert-heavy sweet spot) ---
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 2>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 5>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 10>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 20>>();
-      // Also test other pgm_error values at flush_pct=5
+      // Other pgm_error values
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 128, 5>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 512, 5>>();
-      // Small absolute buffer cap (lookup-heavy optimization)
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 256>>();
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 1024>>();
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 4096>>();
-      // Never-flush: all inserts stay in DPGM, LIPP stays perfectly bulk-loaded
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 250000>>();
+      // --- Drain-during-insert (lookup-heavy, compliant) ---
+      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 1>>();
+      // --- Micro-threshold (lookup-heavy with drain-during-lookup) ---
+      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 8>>();
     }
   }
   if (filename.find("books_100M") != std::string::npos) {
     if (filename.find("mix") != std::string::npos) {
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 1>>();
+      // --- Percentage-based flush ---
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 2>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 5>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 10>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 20>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 128, 5>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 512, 5>>();
-      // Small absolute buffer cap (lookup-heavy optimization)
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 256>>();
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 1024>>();
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 4096>>();
-      // Never-flush: all inserts stay in DPGM, LIPP stays perfectly bulk-loaded
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 250000>>();
+      // --- Drain-during-insert (lookup-heavy, compliant) ---
+      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 1>>();
+      // --- Micro-threshold (lookup-heavy with drain-during-lookup) ---
+      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 8>>();
     }
   }
   if (filename.find("osmc_100M") != std::string::npos) {
     if (filename.find("mix") != std::string::npos) {
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 1>>();
+      // --- Percentage-based flush ---
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 2>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 5>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 10>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 20>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 128, 5>>();
       benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 512, 5>>();
-      // Small absolute buffer cap (lookup-heavy optimization)
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 256>>();
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 1024>>();
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 4096>>();
-      // Never-flush: all inserts stay in DPGM, LIPP stays perfectly bulk-loaded
-      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 250000>>();
+      // --- Drain-during-insert (lookup-heavy, compliant) ---
+      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 1>>();
+      // --- Micro-threshold (lookup-heavy with drain-during-lookup) ---
+      benchmark.template Run<HybridPGMLIPP<uint64_t, BranchingBinarySearch<record>, 64, 100, 8>>();
     }
   }
 }

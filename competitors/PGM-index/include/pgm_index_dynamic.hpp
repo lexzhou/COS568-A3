@@ -287,6 +287,16 @@ public:
     }
 
     /**
+     * Resets the container to empty without deallocating level storage.
+     */
+    void clear() {
+        for (uint8_t i = min_level; i < used_levels; ++i)
+            get_level(i).clear();
+        used_levels = min_level;
+        pgm.clear();
+    }
+
+    /**
      * Constructs the container on the sorted data in the range [first, last).
      * @tparam Iterator
      * @param first, last the range containing the sorted elements to be indexed

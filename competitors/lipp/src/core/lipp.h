@@ -34,7 +34,7 @@ typedef uint8_t bitmap_t;
 #include <chrono>
 #endif
 
-template<class T, class P, bool USE_FMCD = true>
+template<class T, class P, bool USE_FMCD = true, bool TRACK_BOUNDS = false>
 class LIPP
 {
     static_assert(std::is_arithmetic<T>::value, "LIPP key type must be numeric.");
@@ -314,6 +314,8 @@ private:
         int num_inserts, num_insert_to_data;
         int num_items; // size of items
         LinearModel<T> model;
+        T min_key;  // minimum key in subtree (used when TRACK_BOUNDS=true)
+        T max_key;  // maximum key in subtree (used when TRACK_BOUNDS=true)
         Item* items;
         bitmap_t* none_bitmap; // 1 means None, 0 means Data or Child
         bitmap_t* child_bitmap; // 1 means Child. will always be 0 when none_bitmap is 1
@@ -375,6 +377,10 @@ private:
         BITMAP_SET(node->none_bitmap, 0);
         node->child_bitmap = new_bitmap(1);
         node->child_bitmap[0] = 0;
+        if constexpr (TRACK_BOUNDS) {
+            node->min_key = std::numeric_limits<T>::max();
+            node->max_key = std::numeric_limits<T>::lowest();
+        }
 
         return node;
     }
@@ -419,6 +425,10 @@ private:
         node->model.b = mid1_target - node->model.a * mid1_key;
         RT_ASSERT(isfinite(node->model.a));
         RT_ASSERT(isfinite(node->model.b));
+        if constexpr (TRACK_BOUNDS) {
+            node->min_key = key1;  // key1 <= key2 guaranteed by swap above
+            node->max_key = key2;
+        }
 
         { // insert key1&value1
             int pos = PREDICT_POS(node, key1);
@@ -522,6 +532,10 @@ private:
                 node->child_bitmap = new_bitmap(bitmap_size);
                 memset(node->none_bitmap, 0xff, sizeof(bitmap_t) * bitmap_size);
                 memset(node->child_bitmap, 0, sizeof(bitmap_t) * bitmap_size);
+                if constexpr (TRACK_BOUNDS) {
+                    node->min_key = keys[0];
+                    node->max_key = keys[size - 1];
+                }
 
                 for (int item_i = PREDICT_POS(node, keys[0]), offset = 0; offset < size; ) {
                     int next = offset + 1, next_i = -1;
@@ -672,6 +686,10 @@ private:
                 node->child_bitmap = new_bitmap(bitmap_size);
                 memset(node->none_bitmap, 0xff, sizeof(bitmap_t) * bitmap_size);
                 memset(node->child_bitmap, 0, sizeof(bitmap_t) * bitmap_size);
+                if constexpr (TRACK_BOUNDS) {
+                    node->min_key = keys[0];
+                    node->max_key = keys[size - 1];
+                }
 
                 for (int item_i = PREDICT_POS(node, keys[0]), offset = 0; offset < size; ) {
                     int next = offset + 1, next_i = -1;
@@ -828,12 +846,18 @@ private:
         for (int i = 0; i < path_size; i ++) {
             path[i]->num_insert_to_data += insert_to_data;
         }
+        if constexpr (TRACK_BOUNDS) {
+            for (int i = 0; i < path_size; i++) {
+                if (key < path[i]->min_key) path[i]->min_key = key;
+                if (key > path[i]->max_key) path[i]->max_key = key;
+            }
+        }
 
         for (int i = 0; i < path_size; i ++) {
             Node* node = path[i];
             const int num_inserts = node->num_inserts;
             const int num_insert_to_data = node->num_insert_to_data;
-            const bool need_rebuild = node->fixed == 0 && node->size >= node->build_size * 4 && node->size >= 64 && num_insert_to_data * 10 >= num_inserts;
+            const bool need_rebuild = node->fixed == 0 && node->size >= node->build_size * 8 && node->size >= 64 && num_insert_to_data * 10 >= num_inserts;
 
             if (need_rebuild) {
                 const int ESIZE = node->size;
@@ -885,6 +909,10 @@ public:
             int pos = PREDICT_POS(node, key);
             if (BITMAP_GET(node->child_bitmap, pos) == 1) {
                 node = node->items[pos].comp.child;
+                if constexpr (TRACK_BOUNDS) {
+                    if (key < node->min_key || key > node->max_key)
+                        return false;
+                }
             } else {
                 if (BITMAP_GET(node->none_bitmap, pos) == 0 && node->items[pos].comp.data.key == key){
                     value = node->items[pos].comp.data.value;
@@ -893,6 +921,16 @@ public:
                 return false;
             }
         }
+    }
+
+    // Prefetch the root-level items and bitmap for a key.
+    // Call before doing other work, then call find() — the root-level
+    // data may already be in cache, hiding one level of cache misses.
+    void prefetch_find(const T& key) const {
+        int pos = PREDICT_POS(root, key);
+        __builtin_prefetch(&root->none_bitmap[pos / BITMAP_WIDTH], 0, 1);
+        __builtin_prefetch(&root->child_bitmap[pos / BITMAP_WIDTH], 0, 1);
+        __builtin_prefetch(&root->items[pos], 0, 1);
     }
 
     struct StackTuple{
